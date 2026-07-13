@@ -9,11 +9,13 @@ enum ErrorType {
     NotFound = "Session not found",
     AlreadyExists = "Session already exists",
     SessionFull = "Session is full",
+    AlreadyStarted = "Session has already started",
 }
 
 interface SessionState {
     id: string;
     full: boolean;
+    seat?: number;  // assigned seat, 0 = host
 }
 
 export class SessionManager {
@@ -47,9 +49,13 @@ export class SessionManager {
             console.warn('Client ' + client.id() + ' tried to join session with id ' + sessionId + ' which is full');
             return err(ErrorType.SessionFull);
         }
+        if (session.hasLobbyStarted()) {
+            console.warn('Client ' + client.id() + ' tried to join session with id ' + sessionId + ' which has already started');
+            return err(ErrorType.AlreadyStarted);
+        }
         this.clientToSession.set(client, sessionId);
         session.enter(client);
-        return ok({id: sessionId, full: session.isFull()});
+        return ok({id: sessionId, full: session.isFull(), seat: session.getSeat(client)});
     }
 
     leaveSession(client: Client)  {

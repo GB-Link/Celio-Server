@@ -44,6 +44,10 @@ export class Session {
 
     private masterSelected: boolean = false;
 
+    // Room capacity. 2 by default; a multiplayer lobby host raises it to 4
+    // via setRoomSize before the joiners join.
+    private maxPlayers: number = 2;
+
     private receivedStati: Set<string> = new Set();
 
     private clients: Client[] = [];
@@ -51,6 +55,11 @@ export class Session {
     private send$: Subject<OutgoingAckablePacket> = new Subject<OutgoingAckablePacket>();
 
     private started: boolean = false;
+
+    // Set when the host starts a multiplayer lobby. Joins are rejected from
+    // then on, since seats are assigned at start. Distinct from `started`
+    // (first deviceStatus) so 2-player flows keep their join semantics.
+    private lobbyStarted: boolean = false;
 
     private closeSubject: Subject<Session> = new Subject();
 
@@ -96,6 +105,35 @@ export class Session {
                 if (packet) client.emit("deviceData", packet)
                 else console.log("Requested data packet " + seqNum + " not found")
             })
+        },
+
+        // --- multiplayer (3-4 player) relay ---
+
+        // Seat-tagged link frame from one adapter, broadcast to every other
+        // client in the room.
+        relayData: (client: Client, data: any) => {
+            this.clients.forEach(other => {
+                if (other.id() !== client.id()) other.emit("relayData", data);
+            });
+        },
+
+        // Host pressed Start: tell every client its seat and the player
+        // count so each can enter the link mode in the right role.
+        multiLinkStart: (client: Client) => {
+            if (this.getSeat(client) !== 0) return; // host only
+            const playerCount = this.clients.length;
+            if (playerCount < 2) return;
+            this.started = true;
+            this.lobbyStarted = true;
+            console.log("Client " + client.id() + " started the session with " + playerCount + " players");
+            this.clients.forEach(other =>
+                other.emit("multiLinkStart", { seat: this.getSeat(other), playerCount }));
+        },
+
+        // Host sets the room capacity (before joiners join).
+        setRoomSize: (client: Client, size: number) => {
+            if (this.getSeat(client) !== 0) return; // host only
+            this.setMaxPlayers(size);
         }
     };
 
@@ -118,6 +156,9 @@ export class Session {
      * @returns {boolean} - true if the session has started, false otherwise.
      */
     hasStarted(): boolean { return this.started; }
+
+    /** True once the host started a multiplayer lobby. */
+    hasLobbyStarted(): boolean { return this.lobbyStarted; }
 
     private makeCommand(command: CommandType) : CommandPacket {
         return {uuid: uuidv4(), command: command}
@@ -197,7 +238,17 @@ export class Session {
      * @returns {boolean} - true if the session is full, false otherwise.
      */
     isFull(): boolean {
-        return this.clients.length >= 2;
+        return this.clients.length >= this.maxPlayers;
+    }
+
+    /** Set the room capacity. Clamped to 2-4. */
+    setMaxPlayers(n: number) {
+        this.maxPlayers = Math.min(Math.max(Math.floor(n), 2), 4);
+    }
+
+    /** The client's seat (index in join order). 0 = host. -1 if not in session. */
+    getSeat(client: Client): number {
+        return this.clients.findIndex(c => c.id() === client.id());
     }
 
     /**
@@ -240,7 +291,18 @@ export class Session {
         if (this.isFull() && this.hasStarted())
         {
             this.evict()
-        } else {
+        }
+        else if (index === 0 && !this.hasStarted() && this.clients.length > 1
+                 && this.maxPlayers > 2)
+        {
+            // The host left a multiplayer lobby before starting. Seats would
+            // shift and no remaining client knows it became the host, so
+            // close the room. 2-player sessions keep the original
+            // partnerLeft behaviour.
+            console.log("Host left session " + this.sessionId + " before starting, closing it");
+            this.evict();
+        }
+        else {
             this.emitToOppositeSocket(client, "partnerLeft");
             this.removeClient(client);
         }
@@ -276,15 +338,14 @@ export class Session {
      * @param arg
      */
     private emitToOppositeSocket(client: Client, event: string, arg?: any) {
-        if (this.clients.length != 2) return;
-        if (client.id() === this.clients[0].id()) {
-            console.log('Emitting to Client ' + this.clients[1].id() + ': ' + event);
-            this.clients[1].emit(event, arg);
-        }
-        else {
-            console.log('Emitting to Client ' + this.clients[0].id() + ': ' + event);
-            this.clients[0].emit(event, arg);
-        }
+        // Broadcast to every other client. For a 2-client session this is the
+        // single opposite socket (unchanged behaviour); for 3-4 it fans out.
+        this.clients.forEach(other => {
+            if (other.id() !== client.id()) {
+                console.log('Emitting to Client ' + other.id() + ': ' + event);
+                other.emit(event, arg);
+            }
+        });
     }
 
     /**
@@ -294,10 +355,11 @@ export class Session {
      * @param arg
      */
     private emitAckedToOppositeSocket(client: Client, event: string, args?: any) {
-        if (this.clients.length != 2) return;
-        let receiverClient = this.clients[0] === client ? this.clients[1] : this.clients[0];
-        //console.log('Emitting to Client ' + receiverClient.id() + ': ' + event + ' - ' +JSON.stringify(args));
-        this.queueAckablePacket(receiverClient, event, args);
+        // Ackable, ordered fan-out to every other client (single opposite for a
+        // 2-client session).
+        this.clients.forEach(other => {
+            if (other.id() !== client.id()) this.queueAckablePacket(other, event, args);
+        });
     }
 
     /**
