@@ -16,7 +16,7 @@ export class Client {
 
         sessionJoin: (sessionId: string, responseHandler: any) => {
             console.log(this.clientId + ` Client wants to join session ` + sessionId);
-            const sessionState = this.sessionManager.enterSession(this, sessionId);
+            const sessionState = this.sessionManager.enterSession(this, String(sessionId).trim());
             responseHandler(sessionState);
         },
 

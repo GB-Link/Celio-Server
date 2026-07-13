@@ -1,5 +1,5 @@
 import { Session } from "./session.js";
-import { nanoid } from "nanoid";
+import { randomInt } from "node:crypto";
 import { Result } from 'true-myth';
 import { ok, err } from 'true-myth/result';
 import {Client} from "./client.js";
@@ -10,7 +10,13 @@ enum ErrorType {
     AlreadyExists = "Session already exists",
     SessionFull = "Session is full",
     AlreadyStarted = "Session has already started",
+    NoFreeSessionIds = "No free session ids available",
 }
+
+// 1000-9999: always four digits, so codes have no leading-zero ambiguity
+// when typed by hand.
+const SESSION_ID_MIN = 1000;
+const SESSION_ID_MAX_EXCLUSIVE = 10000;
 
 interface SessionState {
     id: string;
@@ -25,7 +31,8 @@ export class SessionManager {
 
     createSession(client: Client) :  Result<SessionState, ErrorType> {
         if (this.clientToSession.has(client)) return err(ErrorType.AlreadyExists);
-        const sessionId: string = nanoid();
+        const sessionId = this.generateFreeSessionId();
+        if (sessionId === null) return err(ErrorType.NoFreeSessionIds);
         const session = new Session(sessionId);
 
         session.close$
@@ -70,6 +77,20 @@ export class SessionManager {
             return;
         }
         session.leave(client);
+    }
+
+    /**
+     * Draw a random four-digit id not held by any active session, or null if
+     * every id is taken.
+     */
+    private generateFreeSessionId(): string | null {
+        // The retry loop below only terminates while free ids remain.
+        if (this.sessions.size >= SESSION_ID_MAX_EXCLUSIVE - SESSION_ID_MIN) return null;
+        let sessionId: string;
+        do {
+            sessionId = randomInt(SESSION_ID_MIN, SESSION_ID_MAX_EXCLUSIVE).toString();
+        } while (this.sessions.has(sessionId));
+        return sessionId;
     }
 
     private findSession(sessionId: string): Session | undefined {
