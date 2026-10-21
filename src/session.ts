@@ -66,7 +66,9 @@ export class Session {
 
     private socketEventHandlers = {
 
-        deviceStatus: (client: Client, statusPacket: StatusPacket) => {
+        deviceStatus: (client: Client, statusPacket: StatusPacket, ack?: (value: unknown) => void) => {
+            // Ack duplicates too: a retry means our first ack was lost.
+            ack?.(true);
             if (this.receivedStati.has(statusPacket.uuid)) {
                 console.warn("Received duplicate status packet");
                 return;
@@ -75,14 +77,18 @@ export class Session {
             this.handleStatusMessage(client, statusPacket);
         },
 
-        deviceData: (client: Client, dataPacket: DataPacket) => {
+        deviceData: (client: Client, data: DataPacket | DataPacket[], ack?: (value: unknown) => void) => {
+            ack?.(true);
             let receivedPacketMap = this.clientState.get(client)?.packets
             if (!receivedPacketMap) {
                 console.log("Received data packet for unknown client");
                 return;
             }
-            receivedPacketMap.set(dataPacket.sequence, dataPacket);
-            this.emitAckedToOppositeSocket(client, "deviceData", dataPacket);
+            // An acking client sends packets as an array; an earlier one, one by one.
+            for (const dataPacket of Array.isArray(data) ? data : [data]) {
+                receivedPacketMap.set(dataPacket.sequence, dataPacket);
+                this.emitAckedToOppositeSocket(client, "deviceData", dataPacket);
+            }
         },
 
         requestData: (client: Client, missingSequenceNumbers: [number]) => {
@@ -132,16 +138,16 @@ export class Session {
         switch (statusPacket.linkStatus) {
             case LinkStatus.AwaitMode:
                 if (!this.masterSelected) {
-                    client.emit("deviceCommand", this.makeCommand(CommandType.SetModeMaster))
+                    this.sendCommand(client, this.makeCommand(CommandType.SetModeMaster))
                     this.masterSelected = true;
                 }
                 else {
-                    client.emit("deviceCommand", this.makeCommand(CommandType.SetModeSlave))
+                    this.sendCommand(client, this.makeCommand(CommandType.SetModeSlave))
                 }
                 break
 
             case LinkStatus.AwaitModeEmulator:
-                client.emit("deviceCommand", this.makeCommand(CommandType.SetModeSlave))
+                this.sendCommand(client, this.makeCommand(CommandType.SetModeSlave))
                 break
 
             case LinkStatus.HandshakeReceived:
@@ -151,8 +157,8 @@ export class Session {
                     .every(state => state.status === LinkStatus.HandshakeReceived);
 
                 if (allHandshakesReceived) {
-                    client.emit("deviceCommand", this.makeCommand(CommandType.StartHandshake))
-                    this.emitToOppositeSocket(client,"deviceCommand", this.makeCommand(CommandType.StartHandshake));
+                    this.sendCommand(client, this.makeCommand(CommandType.StartHandshake))
+                    this.sendCommandToOpposite(client, this.makeCommand(CommandType.StartHandshake));
                 }
                 break
 
@@ -162,7 +168,7 @@ export class Session {
 
             case LinkStatus.LinkConnected:
                 clientState.status = LinkStatus.LinkConnected;
-                this.emitToOppositeSocket(client, "deviceCommand", this.makeCommand(CommandType.ConnectLink))
+                this.sendCommandToOpposite(client, this.makeCommand(CommandType.ConnectLink))
                 break;
 
             case LinkStatus.LinkReconnecting:
@@ -220,9 +226,10 @@ export class Session {
         this.clients.push(client);
         this.clientState.set(client, new ClientState());
         Object.entries(this.socketEventHandlers).forEach(([event, handler]) => {
-            this.clientState.get(client)?.subscription.add(client.fromEvent<any>(event).subscribe((data: any) => handler(client, data)));
+            this.clientState.get(client)?.subscription.add(
+                client.fromEventWithAck<any>(event).subscribe(({data, ack}) => handler(client, data, ack)));
         });
-        this.emitToOppositeSocket(client, "partnerJoined");
+        this.sessionEventToOpposite(client, "partnerJoined");
         client.inSession(true)
         return true;
     }
@@ -239,9 +246,10 @@ export class Session {
         }
         if (this.isFull() && this.hasStarted())
         {
-            this.evict()
+            // The leaver knows; only its partner needs telling.
+            this.evict(client)
         } else {
-            this.emitToOppositeSocket(client, "partnerLeft");
+            this.sessionEventToOpposite(client, "partnerLeft");
             this.removeClient(client);
         }
     }
@@ -263,13 +271,27 @@ export class Session {
     }
 
     /**
-     * Remove all clients from the session. Emits a "sessionClose" event to all clients
+     * Remove all clients from the session. Emits a "sessionClose" event to all
+     * clients but the one leaving, if one is.
+     * @param leaver
      */
-    private evict() {
+    private evict(leaver?: Client) {
         for (let i = this.clients.length - 1; i >= 0; i--) {
-            this.clients[i].emit("sessionClose")
-            this.removeClient(this.clients[i]);
+            const client = this.clients[i];
+            if (client !== leaver) client.emitSessionEvent("sessionClose");
+            this.removeClient(client);
         }
+    }
+
+    /**
+     * Send a session event to the opposite client of the given one. Save to call
+     * when only one client is in the session.
+     * @param client
+     * @param event
+     */
+    private sessionEventToOpposite(client: Client, event: string) {
+        if (this.clients.length != 2) return;
+        (this.clients[0] === client ? this.clients[1] : this.clients[0]).emitSessionEvent(event);
     }
 
     /**
@@ -300,7 +322,32 @@ export class Session {
         if (this.clients.length != 2) return;
         let receiverClient = this.clients[0] === client ? this.clients[1] : this.clients[0];
         //console.log('Emitting to Client ' + receiverClient.id() + ': ' + event + ' - ' +JSON.stringify(args));
-        this.queueAckablePacket(receiverClient, event, args);
+        // An acking client takes deviceData as an array of packets.
+        this.queueAckablePacket(receiverClient, event,
+            event === "deviceData" && receiverClient.acksEvents() ? [args] : args);
+    }
+
+    /**
+     * Send a command to a client: acked, retried and in order with its data for
+     * a client that acks (it acks every command, and drops duplicates by uuid),
+     * as a plain emit for an earlier one.
+     * @param client
+     * @param command
+     */
+    private sendCommand(client: Client, command: CommandPacket) {
+        if (client.acksEvents()) this.queueAckablePacket(client, "deviceCommand", command);
+        else client.emit("deviceCommand", command);
+    }
+
+    /**
+     * sendCommand to the opposite client of the given one. Save to call when
+     * only one client is in the session.
+     * @param client
+     * @param command
+     */
+    private sendCommandToOpposite(client: Client, command: CommandPacket) {
+        if (this.clients.length != 2) return;
+        this.sendCommand(this.clients[0] === client ? this.clients[1] : this.clients[0], command);
     }
 
     /**

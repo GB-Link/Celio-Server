@@ -1,10 +1,25 @@
 import {Socket} from "socket.io";
 import {SessionManager} from "./sessionManager.js";
 import {BehaviorSubject, fromEvent, Observable, switchMap} from 'rxjs';
+import {v4 as uuidv4} from 'uuid';
+
+/**
+ * A received event: its payload, and the callback the sender attached for an
+ * acknowledgement, if it attached one.
+ */
+export interface Received<T> {
+    data: T;
+    ack?: (value: unknown) => void;
+}
 
 export class Client {
 
     private currentlyInSession: boolean = false;
+    // What this client speaks. "acking": it has sent an event with an ack
+    // callback, so it is a Celio-Client that acks and retries (since b057315)
+    // and expects the same of the server. "plain": it sent device traffic
+    // without one, an earlier client. Until either, "unknown".
+    private protocol: "unknown" | "acking" | "plain" = "unknown";
     private socket$: BehaviorSubject<Socket>;
     private eventHandlers = {
 
@@ -72,6 +87,53 @@ export class Client {
         return this.socket$.pipe(
             switchMap((socket: Socket) => fromEvent<T>(socket, event))
         );
+    }
+
+    /**
+     * Like fromEvent, but keeps the payload and the sender's ack callback apart.
+     * (rxjs' fromEvent hands a listener's arguments over as an array when there
+     * is more than one, so an emit with an ack would arrive as [payload, ack].)
+     * @param event - The name of the event to listen for.
+     */
+    fromEventWithAck<T>(event: string): Observable<Received<T>> {
+        return this.socket$.pipe(
+            switchMap((socket: Socket) => new Observable<Received<T>>(observer => {
+                const handler = (...args: any[]) => {
+                    const ack = typeof args[args.length - 1] === "function" ? args.pop() : undefined;
+                    if (ack) this.protocol = "acking";
+                    else if (this.protocol === "unknown") this.protocol = "plain";
+                    observer.next({data: args[0], ack});
+                };
+                socket.on(event, handler);
+                return () => { socket.off(event, handler); };
+            }))
+        );
+    }
+
+    /**
+     * Whether this client acks what it receives, and wants deviceData batched
+     * as an array (true), or is an earlier client (false).
+     */
+    acksEvents(): boolean {
+        return this.protocol === "acking";
+    }
+
+    /**
+     * Send a session event (partnerJoined, partnerLeft, sessionClose). A client
+     * that acks, or one not yet known not to, gets it acked and retried with a
+     * uuid to drop duplicates by; an earlier client, a plain emit, as before.
+     * (A client is told apart only once it sends device traffic, so an earlier
+     * one can see partnerJoined/partnerLeft more than once while it waits for
+     * a partner; it handles them as states, so that is harmless.)
+     * @param event
+     */
+    emitSessionEvent(event: string) {
+        if (this.protocol === "plain") {
+            this.socket.emit(event);
+            return;
+        }
+        this.emitWithRetry(event, {uuid: uuidv4()})
+            .catch(() => console.warn("Client " + this.clientId + " did not ack " + event));
     }
 
     /**
