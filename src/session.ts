@@ -253,6 +253,9 @@ export class Session {
     private removeClient(client: Client) {
         const index = this.clients.findIndex(clientToRemove => clientToRemove.id() === client.id());
         this.clientState.get(client)?.subscription.unsubscribe();
+        // Forget its state too: a stale entry (a partner who left before the
+        // link started) would hold up the next pair's "all handshakes" check.
+        this.clientState.delete(client);
         this.clients.splice(index, 1);
         console.log("Client " + client.id() + " left session");
         client.inSession(false);
